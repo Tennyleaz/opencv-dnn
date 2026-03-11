@@ -4,10 +4,16 @@ import numpy as np
 import time
 import psutil
 import matplotlib.pyplot as plt
+import argparse
+import os
 
 
-def letterbox(img: MatLike, new_shape=(640, 640), color: Scalar = (114, 114, 114)):
-    shape = img.shape[:2]
+def letterbox(
+    img: MatLike,
+    new_shape: tuple[int, int] = (640, 640),
+    color: Scalar = (114, 114, 114),
+):
+    shape: tuple[int, int] = img.shape[:2]
     ratio = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     new_unpad = (int(shape[1] * ratio), int(shape[0] * ratio))
     dw = new_shape[1] - new_unpad[0]
@@ -17,13 +23,11 @@ def letterbox(img: MatLike, new_shape=(640, 640), color: Scalar = (114, 114, 114
     img_resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(round(dh)), int(round(dh))
     left, right = int(round(dw)), int(round(dw))
-    img_padded = cv2.copyMakeBorder(
-        img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
-    )
+    img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return img_padded, ratio, left, top
 
 
-def detect_objects(frame: MatLike, display_width=800):
+def detect_objects(frame: MatLike):
     # Load dnn model
     model_path = "model/yolov8n.onnx"
     net = cv2.dnn.readNet(model_path)
@@ -32,8 +36,9 @@ def detect_objects(frame: MatLike, display_width=800):
     with open("model/coco.names.txt", "r") as f:
         class_names = [line.strip() for line in f.readlines()]
 
+    # Use GPU
+    # net.setPreferableBackend(cv2.dnn.DNN_TARGET_CUDA)
     # Use CPU
-    # net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
     input_size = 640
@@ -42,12 +47,8 @@ def detect_objects(frame: MatLike, display_width=800):
     mem_before = process.memory_info().rss / (1024**2)
     start_time = time.time()
     # Preprocess
-    img_letterboxed, ratio, dw, dh = letterbox(
-        frame, new_shape=(input_size, input_size)
-    )
-    blob = cv2.dnn.blobFromImage(
-        img_letterboxed, 1 / 255.0, (input_size, input_size), swapRB=True, crop=False
-    )
+    img_letterboxed, ratio, dw, dh = letterbox(frame, new_shape=(input_size, input_size))
+    blob = cv2.dnn.blobFromImage(img_letterboxed, 1 / 255.0, (input_size, input_size), swapRB=True, crop=False)
     net.setInput(blob)
     # Inference
     outputs = net.forward()
@@ -62,13 +63,9 @@ def detect_objects(frame: MatLike, display_width=800):
     # Handle output shape variations
     if len(outputs.shape) == 3 and outputs.shape[1] == 25200 and outputs.shape[2] == 85:
         output = outputs[0]
-    elif (
-        len(outputs.shape) == 3 and outputs.shape[1] == 84 and outputs.shape[2] == 8400
-    ):
+    elif len(outputs.shape) == 3 and outputs.shape[1] == 84 and outputs.shape[2] == 8400:
         output = outputs[0].T
-    elif (
-        len(outputs.shape) == 3 and outputs.shape[1] == 8400 and outputs.shape[2] == 85
-    ):
+    elif len(outputs.shape) == 3 and outputs.shape[1] == 8400 and outputs.shape[2] == 85:
         output = outputs[0]
     else:
         raise ValueError(f"Unexpected output shape: {outputs.shape}")
@@ -104,6 +101,9 @@ def detect_objects(frame: MatLike, display_width=800):
     # Apply Non-Maximum Suppression (NMS)
     indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.3, 0.4)
     if len(indices) > 0:
+        if isinstance(indices, tuple):
+            indices = indices[0]
+        indices = np.array(indices).reshape(-1).tolist()
         # Draw Boxes and Labels with white background + larger text
         for i in indices:
             x, y, w, h = boxes[i]
@@ -143,30 +143,63 @@ def detect_objects(frame: MatLike, display_width=800):
             )
             # Draw bounding box
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 4)
+            # Also print the found object in stdout
+            print(f" - Found {label} (confidence {confidence:.2f})")
+    else:
+        print(" - No object found.")
+
     # Print performance stats
     print(f" Inference Time: {inference_time:.3f} seconds")
     print(f" Memory Used: {mem_used:.3f} MB")
-    # Resize for display (maintain aspect ratio)
-    h, w = frame.shape[:2]
+    return frame
+
+
+def resize_for_display(img: MatLike, display_width: int = 800) -> MatLike:
+    h, w = img.shape[:2]
+    if w <= 0:
+        return img
+    if w <= display_width:
+        return img
     scale = display_width / w
     display_height = int(h * scale)
-    resized_frame = cv2.resize(frame, (display_width, display_height))
-    return resized_frame
+    return cv2.resize(img, (display_width, display_height))
 
 
 def main():
-    image = cv2.imread("test.jpg")
+    parser = argparse.ArgumentParser(description="Run DNN object detection on an image.")
+    parser.add_argument("--image", default="test.jpg", help="Input image path (default: test.jpg)")
+    parser.add_argument("--show", action="store_true", help="Display result image on screen (Matplotlib).")
+    parser.add_argument("--out", help="Save result image to this path.")
+    parser.add_argument("--display-width", type=int, default=800, help="Display width used with --show.")
+    args = parser.parse_args()
+
+    image = cv2.imread(args.image)
     if image is None:
-        print("Cannot load image!")
+        print(f"Cannot load image: {args.image}")
         return
 
     result = detect_objects(image)
-    # Display image in Jupyter Notebook
-    result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-    plt.figure(figsize=(10, 8))
-    plt.imshow(result_rgb)
-    plt.axis("off")
-    plt.show()
+
+    if args.out:
+        out_dir = os.path.dirname(args.out)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        ok = cv2.imwrite(args.out, result)
+        if not ok:
+            print(f"Failed to save image to: {args.out}")
+            return
+        print(f"Saved result to: {args.out}")
+
+    if args.show:
+        display_img = resize_for_display(result, display_width=args.display_width)
+        result_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+        plt.figure(figsize=(10, 8))
+        plt.imshow(result_rgb)
+        plt.axis("off")
+        plt.show()
+
+    if (not args.show) and (not args.out):
+        print("No output selected. Use --show to display and/or --out to save.")
 
 
 if __name__ == "__main__":
